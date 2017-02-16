@@ -18,9 +18,6 @@
 #endif // MBED_BUILD_TIMESTAMP
 
 
-DEFINE_ENUM_STRINGS(IOTHUB_CLIENT_CONFIRMATION_RESULT, IOTHUB_CLIENT_CONFIRMATION_RESULT_VALUES);
-
-
 static char hostName[128] = {0, };
 static char deviceId[128] = {0, };
 static char deviceKey[128] = {0, };
@@ -158,7 +155,7 @@ static void sendMessage(IOTHUB_CLIENT_HANDLE iotHubClientHandle, const unsigned 
     }
     else
     {
-        if (IoTHubClient_SendEventAsync(iotHubClientHandle, messageHandle, SendConfirmationCallback, NULL) != IOTHUB_CLIENT_OK)
+        if (IoTHubClient_SendEventAsync(iotHubClientHandle, messageHandle, NULL, NULL) != IOTHUB_CLIENT_OK)
         {
             printf("failed to hand over the message to IoTHubClient");
         }
@@ -303,7 +300,7 @@ void remote_monitoring_run(void)
         }
         else
         {
-            if (NULL == fread(msgText, 1, sizeof(msgText), fpConfig))
+            if (0 == fread(msgText, 1, sizeof(msgText), fpConfig))
             {
                 printf("Get connection string fail.\r\n");
             }
@@ -408,7 +405,7 @@ void remote_monitoring_run(void)
                                 thermostat->Commands = (char*)STRING_c_str(commandsMetadata);
 
                                 /* Here is the actual send of the Device Info */
-                                if (SERIALIZE(&buffer, &bufferSize, thermostat->ObjectType, thermostat->Version, thermostat->IsSimulatedDevice, thermostat->DeviceProperties, thermostat->Commands) != IOT_AGENT_OK)
+                                if (SERIALIZE(&buffer, &bufferSize, thermostat->ObjectType, thermostat->Version, thermostat->IsSimulatedDevice, thermostat->DeviceProperties, thermostat->Commands) != CODEFIRST_OK)
                                 {
                                     (void)printf("Failed serializing\r\n");
                                 }
@@ -482,3 +479,10 @@ void remote_monitoring_run(void)
         platform_deinit();
     }
 }
+
+int main(void)
+{
+    remote_monitoring_run();
+    return 0;
+}
+
