@@ -2,7 +2,7 @@
 // Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
 #ifndef WINCE
-#include "iothubtransportamqp.h"
+#include "iothubtransportmqtt.h"
 #else
 #include "iothubtransporthttp.h"
 #endif
@@ -339,12 +339,13 @@ void remote_monitoring_run(void)
             IOTHUB_CLIENT_CONFIG config;
             IOTHUB_CLIENT_HANDLE iotHubClientHandle;
 
+			memset(&config, 0, sizeof config);
             config.deviceId = deviceId;
             config.deviceKey = deviceKey;
             config.iotHubName = hostName;
             config.iotHubSuffix = hubSuffix;
 #ifndef WINCE
-            config.protocol = AMQP_Protocol;
+            config.protocol = MQTT_Protocol;
 #else
             config.protocol = HTTP_Protocol;
 #endif
