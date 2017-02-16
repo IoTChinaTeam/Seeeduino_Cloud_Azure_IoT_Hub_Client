@@ -13,6 +13,10 @@
 #include "azure_c_shared_utility/threadapi.h"
 #include "azure_c_shared_utility/platform.h"
 
+#include <sys/sysinfo.h>
+#include <sys/utsname.h>
+#include <ctype.h>
+
 #ifdef MBED_BUILD_TIMESTAMP
 #include "certs.h"
 #endif // MBED_BUILD_TIMESTAMP
@@ -25,6 +29,8 @@ static char hubSuffix[128] = {0, };
 
 static char msgText[2048] = {0, };
 static char msgBuffer[2048] = {0, };
+
+static int telemetryInterval = 5;
 
 
 // Define the Model
@@ -286,6 +292,157 @@ static int getAccountInfo(char *buffer)
     return result;
 }
 
+void AllocAndPrintf(unsigned char** buffer, size_t* size, const char* format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    *size = vsnprintf(NULL, 0, format, args);
+    va_end(args);
+
+    *buffer = malloc(*size + 1);
+    va_start(args, format);
+    vsprintf((char*)*buffer, format, args);
+    va_end(args);
+}
+
+void ReportSystemProperties(IOTHUB_CLIENT_HANDLE iotHubClientHandle)
+{
+    struct sysinfo sysInfo;
+    sysinfo(&sysInfo);
+        
+    struct utsname sysName;
+    uname(&sysName);
+    
+    unsigned char report[256] = { 0 };
+    
+    size_t len = snprintf(report, sizeof(report), "{ 'System': { 'InstalledRAM': '%u MB', 'Platform': '%s %s' } }",
+        sysInfo.totalram * sysInfo.mem_unit / 1024 / 1024,
+        sysName.sysname,
+        sysName.release);
+    if (IoTHubClient_SendReportedState(iotHubClientHandle, report, len, NULL, NULL) != IOTHUB_CLIENT_OK)
+    {	
+        (void)printf("Failed to report system properties\r\n");
+    }
+    else
+    {
+        (void)printf("System properties successfully reported\r\n");
+    }
+}
+
+void ReportSupportedMethods(IOTHUB_CLIENT_HANDLE iotHubClientHandle)
+{
+    unsigned char report[256] = { 0 };
+    
+    size_t len = snprintf(report, sizeof(report), "{ 'SupportedMethods': { 'SetRGBLED--rgb-int': 'Set color of LED' } }");
+    if (IoTHubClient_SendReportedState(iotHubClientHandle, report, len, NULL, NULL) != IOTHUB_CLIENT_OK)
+    {
+        (void)printf("Failed to report supported methods\r\n");
+    }
+    else
+    {
+        (void)printf("Supported methods successfully reported\r\n");
+    }
+}
+
+void ReportConfigProperties(IOTHUB_CLIENT_HANDLE iotHubClientHandle)
+{
+    unsigned char report[256] = { 0 };
+    
+    size_t len = snprintf(report, sizeof(report), "{ 'Config': { 'TelemetryInterval': %d } }", telemetryInterval);
+    if (IoTHubClient_SendReportedState(iotHubClientHandle, report, len, NULL, NULL) != IOTHUB_CLIENT_OK)
+    {	
+        (void)printf("Failed to report config properties\r\n");
+    }
+    else
+    {
+        (void)printf("Config properties successfully reported\r\n");
+    }
+}
+
+bool GetNumberFromString(const unsigned char* text, size_t size, int* pValue)
+{
+    const unsigned char* pStart = text;	
+    for( ; pStart < text + size; pStart++)
+    {
+        if (isdigit(*pStart))
+        {
+            break;
+        }
+    }
+    
+    const unsigned char* pEnd = pStart + 1;
+    for ( ; pEnd <= text + size; pEnd++)
+    {
+        if (!isdigit(*pEnd))
+        {
+            break;
+        }
+    }
+    
+    if (pStart >= text + size)
+    {
+        return false;
+    }
+    
+    unsigned char buffer[16] = { 0 };
+    strncpy(buffer, pStart, pEnd - pStart);
+
+    *pValue = atoi(buffer);
+    return true;
+}
+
+int OnDeviceMethodInvoked(const char* method_name, const unsigned char* payload, size_t size, unsigned char** response, size_t* resp_size, void* userContextCallback)
+{
+    printf("Method call: name = %s, payload = %s\r\n", method_name, payload);
+    
+    if (strcmp(method_name, "SetRGBLED") != 0)
+    {
+        AllocAndPrintf(response, resp_size, "{'message': 'Unknown method %s'}", method_name);
+        return IOTHUB_CLIENT_OK;
+    }
+    
+    int rgb;
+    if (!GetNumberFromString(payload, size, &rgb))
+    {
+        AllocAndPrintf(response, resp_size, "{ 'message': 'Invalid payload' }");
+    }
+    else
+    {
+        FILE *fpConfig;
+        if (NULL == (fpConfig=fopen("AzureMessageReceive","w")))		
+        {
+            printf("Open azure message content file fail.\r\n");
+
+            AllocAndPrintf(response, resp_size, "{ 'message': 'Open azure message content file fail' }");
+        }
+        else
+        {
+            fprintf(fpConfig, "\"SetRGBLed\":%d", rgb);
+            fclose(fpConfig);
+            
+            AllocAndPrintf(response, resp_size, "{ 'message': 'Accepted, rgb = %d' }", rgb);
+        }
+    }
+
+    return IOTHUB_CLIENT_OK;
+}
+
+void OnDesiredPropertyChanged(DEVICE_TWIN_UPDATE_STATE update_state, const unsigned char* payLoad, size_t size, void* userContextCallback)
+{
+    printf("Property changed: %s", payLoad);
+    
+    unsigned char *p = strstr(payLoad, "\"TelemetryInterval\":");
+    
+    int interval;
+    if (GetNumberFromString(p, size - (p - payLoad), &interval))
+    {
+        telemetryInterval = interval;
+        
+        IOTHUB_CLIENT_HANDLE iotHubClientHandle = (IOTHUB_CLIENT_HANDLE)userContextCallback;
+        ReportConfigProperties(iotHubClientHandle);
+    }
+}
+
 void remote_monitoring_run(void)
 {
     FILE *fpConfig;
@@ -339,7 +496,7 @@ void remote_monitoring_run(void)
             IOTHUB_CLIENT_CONFIG config;
             IOTHUB_CLIENT_HANDLE iotHubClientHandle;
 
-			memset(&config, 0, sizeof config);
+            memset(&config, 0, sizeof config);
             config.deviceId = deviceId;
             config.deviceKey = deviceKey;
             config.iotHubName = hostName;
@@ -376,6 +533,14 @@ void remote_monitoring_run(void)
                     if (IoTHubClient_SetMessageCallback(iotHubClientHandle, IoTHubMessage, thermostat) != IOTHUB_CLIENT_OK)
                     {
                         printf("unable to IoTHubClient_SetMessageCallback\r\n");
+                    }
+                    else if (IoTHubClient_SetDeviceMethodCallback(iotHubClientHandle, OnDeviceMethodInvoked, (void*)iotHubClientHandle) != IOTHUB_CLIENT_OK)
+                    {
+                        printf("unable to IoTHubClient_SetDeviceMethodCallback\r\n");
+                    }
+                    else if (IoTHubClient_SetDeviceTwinCallback(iotHubClientHandle, OnDesiredPropertyChanged, (void*)iotHubClientHandle) != IOTHUB_CLIENT_OK)
+                    {
+                        printf("unable to IoTHubClient_SetDeviceTwinCallback\r\n");
                     }
                     else
                     {
@@ -420,6 +585,10 @@ void remote_monitoring_run(void)
 
                             STRING_delete(commandsMetadata);
                         }
+                        
+                        ReportSystemProperties(iotHubClientHandle);
+                        ReportSupportedMethods(iotHubClientHandle);
+                        ReportConfigProperties(iotHubClientHandle);
 
                         thermostat->Temperature = 0;
                         thermostat->Humidity = 0;
@@ -429,6 +598,8 @@ void remote_monitoring_run(void)
 
                         while(1)
                         {
+                            ThreadAPI_Sleep(telemetryInterval * 1000);
+                            
                             memset(msgText, 0, sizeof(msgText));
                             
                             if (NULL == (fpConfig=fopen("AzureMessageSend","r")))
