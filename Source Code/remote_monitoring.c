@@ -22,16 +22,17 @@
 #endif // MBED_BUILD_TIMESTAMP
 
 
-static char hostName[128] = {0, };
-static char deviceId[128] = {0, };
-static char deviceKey[128] = {0, };
-static char hubSuffix[128] = {0, };
+static char hostName[128] = { 0, };
+static char deviceId[128] = { 0, };
+static char deviceKey[128] = { 0, };
+static char hubSuffix[128] = { 0, };
 
-static char msgText[2048] = {0, };
-static char msgBuffer[2048] = {0, };
+static char msgText[2048] = { 0, };
+static char msgBuffer[2048] = { 0, };
 
-static int telemetryInterval = 5;
-
+static char g_firmwareVersion[16] = { 0 };
+static int g_telemetryInterval = 5;
+static IOTHUB_CLIENT_HANDLE g_iotHubClientHandle = NULL;
 
 // Define the Model
 BEGIN_NAMESPACE(Contoso);
@@ -72,12 +73,83 @@ DECLARE_MODEL(Thermostat,
 
 END_NAMESPACE(Contoso);
 
+/* utilities region */
+void AllocAndPrintf(unsigned char** buffer, size_t* size, const char* format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    *size = vsnprintf(NULL, 0, format, args);
+    va_end(args);
+
+    *buffer = malloc(*size + 1);
+    va_start(args, format);
+    vsprintf((char*)*buffer, format, args);
+    va_end(args);
+}
+
+void AllocAndVPrintf(unsigned char** buffer, size_t* size, const char* format, va_list argptr)
+{
+    *size = vsnprintf(NULL, 0, format, argptr);
+
+    *buffer = malloc(*size + 1);
+    vsprintf((char*)*buffer, format, argptr);
+}
+
+bool GetNumberFromString(const unsigned char* text, size_t size, int* pValue)
+{
+    const unsigned char* pStart = text;
+    for (; pStart < text + size; pStart++)
+    {
+        if (isdigit(*pStart))
+        {
+            break;
+        }
+    }
+
+    const unsigned char* pEnd = pStart + 1;
+    for (; pEnd <= text + size; pEnd++)
+    {
+        if (!isdigit(*pEnd))
+        {
+            break;
+        }
+    }
+
+    if (pStart >= text + size)
+    {
+        return false;
+    }
+
+    unsigned char buffer[16] = { 0 };
+    strncpy(buffer, pStart, pEnd - pStart);
+
+    *pValue = atoi(buffer);
+    return true;
+}
+
+char* FormatTime(time_t* time)
+{
+    static char buffer[128];
+
+    struct tm* p = gmtime(time);
+
+    sprintf(buffer, "%04d-%02d-%02dT%02d:%02d:%02dZ",
+        p->tm_year + 1900,
+        p->tm_mon + 1,
+        p->tm_mday,
+        p->tm_hour,
+        p->tm_min,
+        p->tm_sec);
+
+    return buffer;
+}
+/* utilities region end */
 
 static void ReceivedMessageSave(char *buffer)
 {
     FILE *fpConfig;
-    
-    if (NULL == (fpConfig=fopen("AzureMessageReceive","w")))
+
+    if (NULL == (fpConfig = fopen("AzureMessageReceive", "w")))
     {
         printf("Open azure message content file fail.\r\n");
     }
@@ -90,7 +162,7 @@ static void ReceivedMessageSave(char *buffer)
 
 EXECUTE_COMMAND_RESULT SetTemperature(Thermostat* thermostat, int temperature)
 {
-    char data[128] = {0, };
+    char data[128] = { 0, };
     snprintf(data, sizeof(data), "\"SetTemperature\":%d", temperature);
     (void)printf("%s\r\n", data);
     ReceivedMessageSave(data);
@@ -99,7 +171,7 @@ EXECUTE_COMMAND_RESULT SetTemperature(Thermostat* thermostat, int temperature)
 
 EXECUTE_COMMAND_RESULT SetHumidity(Thermostat* thermostat, int humidity)
 {
-    char data[128] = {0, };
+    char data[128] = { 0, };
     snprintf(data, sizeof(data), "\"SetHumidity\":%d", humidity);
     (void)printf("%s\r\n", data);
     ReceivedMessageSave(data);
@@ -108,7 +180,7 @@ EXECUTE_COMMAND_RESULT SetHumidity(Thermostat* thermostat, int humidity)
 
 EXECUTE_COMMAND_RESULT SetLight(Thermostat* thermostat, int light)
 {
-    char data[128] = {0, };
+    char data[128] = { 0, };
     snprintf(data, sizeof(data), "\"SetLight\":%d", light);
     (void)printf("%s\r\n", data);
     ReceivedMessageSave(data);
@@ -117,7 +189,7 @@ EXECUTE_COMMAND_RESULT SetLight(Thermostat* thermostat, int light)
 
 EXECUTE_COMMAND_RESULT SetSound(Thermostat* thermostat, int sound)
 {
-    char data[128] = {0, };
+    char data[128] = { 0, };
     snprintf(data, sizeof(data), "\"SetSound\":%d", sound);
     (void)printf("%s\r\n", data);
     ReceivedMessageSave(data);
@@ -126,7 +198,7 @@ EXECUTE_COMMAND_RESULT SetSound(Thermostat* thermostat, int sound)
 
 EXECUTE_COMMAND_RESULT SetRGBLed(Thermostat* thermostat, int rgbled)
 {
-    char data[128] = {0, };
+    char data[128] = { 0, };
     snprintf(data, sizeof(data), "\"SetRGBLed\":%d", rgbled);
     (void)printf("%s\r\n", data);
     ReceivedMessageSave(data);
@@ -134,14 +206,14 @@ EXECUTE_COMMAND_RESULT SetRGBLed(Thermostat* thermostat, int rgbled)
 }
 
 static void SendConfirmationCallback(IOTHUB_CLIENT_CONFIRMATION_RESULT result, void* userContextCallback)
-{   
+{
     FILE *fpConfig;
-    char data[128] = {0, };
-    
+    char data[128] = { 0, };
+
     snprintf(data, sizeof(data), "%s", ENUM_TO_STRING(IOTHUB_CLIENT_CONFIRMATION_RESULT, result));
     (void)printf(data);
-    
-    if (NULL == (fpConfig=fopen("run.log","w")))
+
+    if (NULL == (fpConfig = fopen("run.log", "w")))
     {
         printf("Open log file fail.\r\n");
     }
@@ -179,11 +251,11 @@ static void sendMessage(IOTHUB_CLIENT_HANDLE iotHubClientHandle, const unsigned 
 static IOTHUBMESSAGE_DISPOSITION_RESULT IoTHubMessage(IOTHUB_MESSAGE_HANDLE message, void* userContextCallback)
 {
     FILE *fpConfig;
-    
+
     IOTHUBMESSAGE_DISPOSITION_RESULT result;
     const unsigned char* buffer;
     size_t size;
-    
+
     if (IoTHubMessage_GetByteArray(message, &buffer, &size) != IOTHUB_MESSAGE_OK)
     {
         printf("unable to IoTHubMessage_GetByteArray\r\n");
@@ -191,7 +263,7 @@ static IOTHUBMESSAGE_DISPOSITION_RESULT IoTHubMessage(IOTHUB_MESSAGE_HANDLE mess
     }
     else
     {
-        if (NULL == (fpConfig=fopen("AzureMessageReceive","w")))
+        if (NULL == (fpConfig = fopen("AzureMessageReceive", "w")))
         {
             printf("Open azure message content file fail.\r\n");
         }
@@ -200,7 +272,7 @@ static IOTHUBMESSAGE_DISPOSITION_RESULT IoTHubMessage(IOTHUB_MESSAGE_HANDLE mess
             fwrite(buffer, 1, size, fpConfig);
             fclose(fpConfig);
         }
-  
+
         /*buffer is not zero terminated*/
         char* temp = malloc(size + 1);
         if (temp == NULL)
@@ -229,178 +301,187 @@ static int getAccountInfo(char *buffer)
 {
     int i, result = 1;
     char *ptr;
-    
+
     ptr = strstr(buffer, "???");
-    if(ptr)
+    if (ptr)
     {
         result = 0;
-        return result;  
+        return result;
     }
-    
+
     ptr = strstr(buffer, "HOST_NAME:");
-    if(ptr)
+    if (ptr)
     {
         i = 0;
-        while(1)
+        while (1)
         {
-            if(i < sizeof(hostName))hostName[i ++] = *(ptr + 10 + i);
-            if(*(ptr + 10 + i) == '.' && *(ptr + 10 + i + 1) == 'a' && *(ptr + 10 + i + 2) == 'z' && *(ptr + 10 + i + 3) == 'u' && *(ptr + 10 + i + 4) == 'r' && *(ptr + 10 + i + 5) == 'e')break;
+            if (i < sizeof(hostName))hostName[i++] = *(ptr + 10 + i);
+            if (*(ptr + 10 + i) == '.' && *(ptr + 10 + i + 1) == 'a' && *(ptr + 10 + i + 2) == 'z' && *(ptr + 10 + i + 3) == 'u' && *(ptr + 10 + i + 4) == 'r' && *(ptr + 10 + i + 5) == 'e')break;
         }
         hostName[i] = '\0';
         printf("hostName is %s\r\n", hostName);
     }
-    
+
     ptr = strstr(buffer, "azure-devices.");
-    if(ptr)
+    if (ptr)
     {
         i = 0;
-        while(1)
+        while (1)
         {
-            if(i < sizeof(hubSuffix))hubSuffix[i ++] = *(ptr + i);
-            if(*(ptr + i) == '\n')break;
+            if (i < sizeof(hubSuffix))hubSuffix[i++] = *(ptr + i);
+            if (*(ptr + i) == '\n')break;
         }
         hubSuffix[i] = '\0';
         printf("hubSuffix is %s\r\n", hubSuffix);
     }
-    
+
     ptr = strstr(buffer, "DEVICE_ID:");
-    if(ptr)
+    if (ptr)
     {
         i = 0;
-        while(1)
+        while (1)
         {
-            if(i < sizeof(deviceId))deviceId[i ++] = *(ptr + 10 + i);
-            if(*(ptr + 10 + i) == '\n')break;
+            if (i < sizeof(deviceId))deviceId[i++] = *(ptr + 10 + i);
+            if (*(ptr + 10 + i) == '\n')break;
         }
         deviceId[i] = '\0';
         printf("deviceId is %s\r\n", deviceId);
     }
-    
+
     ptr = strstr(buffer, "DEVICE_KEY:");
-    if(ptr)
+    if (ptr)
     {
         i = 0;
-        while(1)
+        while (1)
         {
-            if(i < sizeof(deviceKey))deviceKey[i ++] = *(ptr + 11 + i);
-            if(*(ptr + 11 + i) == 0 || *(ptr + 11 + i) == '\n')break;
+            if (i < sizeof(deviceKey))deviceKey[i++] = *(ptr + 11 + i);
+            if (*(ptr + 11 + i) == 0 || *(ptr + 11 + i) == '\n')break;
         }
         deviceKey[i] = '\0';
         printf("deviceKey is %s\r\n", deviceKey);
     }
-    
+
     return result;
 }
 
-void AllocAndPrintf(unsigned char** buffer, size_t* size, const char* format, ...)
+void LoadConfig()
 {
-    va_list args;
-    va_start(args, format);
-    *size = vsnprintf(NULL, 0, format, args);
-    va_end(args);
+    FILE* fp;
 
-    *buffer = malloc(*size + 1);
-    va_start(args, format);
-    vsprintf((char*)*buffer, format, args);
-    va_end(args);
+    strcpy(g_firmwareVersion, "0.1");
+    if (NULL == (fp = fopen("firmwareVersion", "r")))
+    {
+        printf("Failed to open firmwareVersion file to read\r\n");
+    }
+    else
+    {
+        fgets(g_firmwareVersion, sizeof(g_firmwareVersion), fp);
+        fclose(fp);
+    }
+    printf("Set firmwareVersion = %s\r\n", g_firmwareVersion);
+
+    g_telemetryInterval = 15;
+    if (NULL == (fp = fopen("telemetryInterval", "r")))
+    {
+        printf("Failed to open telemetryInterval file to read\r\n");
+    }
+    else
+    {
+        char buffer[16] = { 0 };
+        fgets(buffer, sizeof(buffer), fp);
+        fclose(fp);
+
+        int telemetryInterval = atoi(buffer);
+        if (telemetryInterval > 0)
+        {
+            g_telemetryInterval = telemetryInterval;
+        }
+    }
+    printf("Set telemetry interval = %u\r\n", g_telemetryInterval);
 }
 
-void ReportSystemProperties(IOTHUB_CLIENT_HANDLE iotHubClientHandle)
+void WriteConfig()
+{
+    FILE* fp;
+
+    if (NULL == (fp = fopen("firmwareVersion", "w")))
+    {
+        printf("Failed to open firmwareVersion file to write\r\n");
+    }
+    else
+    {
+        fprintf(fp, g_firmwareVersion);
+        fclose(fp);
+    }
+
+    if (NULL == (fp = fopen("telemetryInterval", "w")))
+    {
+        printf("Failed to open telemetryInterval file to write\r\n");
+    }
+    else
+    {
+        fprintf(fp, "%u", g_telemetryInterval);
+        fclose(fp);
+    }
+}
+
+void UpdateReportedProperties(const char* format, ...)
+{
+    unsigned char* report;
+    size_t len;
+
+    va_list args;
+    va_start(args, format);
+    AllocAndVPrintf(&report, &len, format, args);
+    va_end(args);
+
+    if (IoTHubClient_SendReportedState(g_iotHubClientHandle, report, len, NULL, NULL) != IOTHUB_CLIENT_OK)
+    {
+        (void)printf("Failed to update reported properties: %.*s\r\n", len, report);
+    }
+    else
+    {
+        (void)printf("Succeeded in updating reported properties: %.*s\r\n", len, report);
+    }
+
+    free(report);
+}
+
+void ReportSystemProperties()
 {
     struct sysinfo sysInfo;
     sysinfo(&sysInfo);
-        
+
     struct utsname sysName;
     uname(&sysName);
-    
-    unsigned char report[256] = { 0 };
-    
-    size_t len = snprintf(report, sizeof(report), "{ 'System': { 'InstalledRAM': '%u MB', 'Platform': '%s %s' } }",
+
+    time_t now;
+    time(&now);
+
+    UpdateReportedProperties(
+        "{ 'System': { 'InstalledRAM': '%u MB', 'Platform': '%s %s', 'FirmwareVersion': '%s' }, 'Device': { 'StartupTime': '%s' } }",
         sysInfo.totalram * sysInfo.mem_unit / 1024 / 1024,
         sysName.sysname,
-        sysName.release);
-    if (IoTHubClient_SendReportedState(iotHubClientHandle, report, len, NULL, NULL) != IOTHUB_CLIENT_OK)
-    {	
-        (void)printf("Failed to report system properties\r\n");
-    }
-    else
-    {
-        (void)printf("System properties successfully reported\r\n");
-    }
+        sysName.release,
+        g_firmwareVersion,
+        FormatTime(&now));
 }
 
-void ReportSupportedMethods(IOTHUB_CLIENT_HANDLE iotHubClientHandle)
+void ReportSupportedMethods()
 {
-    unsigned char report[256] = { 0 };
-    
-    size_t len = snprintf(report, sizeof(report), "{ 'SupportedMethods': { 'SetRGBLED--rgb-int': 'Set color of LED' } }");
-    if (IoTHubClient_SendReportedState(iotHubClientHandle, report, len, NULL, NULL) != IOTHUB_CLIENT_OK)
-    {
-        (void)printf("Failed to report supported methods\r\n");
-    }
-    else
-    {
-        (void)printf("Supported methods successfully reported\r\n");
-    }
+    UpdateReportedProperties("{ 'SupportedMethods': { 'SetRGBLED--rgb-int': 'Set color of LED', 'InitiateFirmwareUpdate--FwPackageUri-string': 'Updates device Firmware. Use parameter FwPackageUri to specifiy the URI of the firmware file, e.g. https://iotrmassets.blob.core.windows.net/firmwares/FW20.bin' } }");
 }
 
-void ReportConfigProperties(IOTHUB_CLIENT_HANDLE iotHubClientHandle)
+void ReportConfigProperties()
 {
-    unsigned char report[256] = { 0 };
-    
-    size_t len = snprintf(report, sizeof(report), "{ 'Config': { 'TelemetryInterval': %d } }", telemetryInterval);
-    if (IoTHubClient_SendReportedState(iotHubClientHandle, report, len, NULL, NULL) != IOTHUB_CLIENT_OK)
-    {	
-        (void)printf("Failed to report config properties\r\n");
-    }
-    else
-    {
-        (void)printf("Config properties successfully reported\r\n");
-    }
+    UpdateReportedProperties(
+        "{ 'Config': { 'TelemetryInterval': %d } }",
+        g_telemetryInterval);
 }
 
-bool GetNumberFromString(const unsigned char* text, size_t size, int* pValue)
+/* Device method handler region */
+void OnMethodSetRGBLED(const unsigned char* payload, size_t size, unsigned char** response, size_t* resp_size)
 {
-    const unsigned char* pStart = text;	
-    for( ; pStart < text + size; pStart++)
-    {
-        if (isdigit(*pStart))
-        {
-            break;
-        }
-    }
-    
-    const unsigned char* pEnd = pStart + 1;
-    for ( ; pEnd <= text + size; pEnd++)
-    {
-        if (!isdigit(*pEnd))
-        {
-            break;
-        }
-    }
-    
-    if (pStart >= text + size)
-    {
-        return false;
-    }
-    
-    unsigned char buffer[16] = { 0 };
-    strncpy(buffer, pStart, pEnd - pStart);
-
-    *pValue = atoi(buffer);
-    return true;
-}
-
-int OnDeviceMethodInvoked(const char* method_name, const unsigned char* payload, size_t size, unsigned char** response, size_t* resp_size, void* userContextCallback)
-{
-    printf("Method call: name = %s, payload = %s\r\n", method_name, payload);
-    
-    if (strcmp(method_name, "SetRGBLED") != 0)
-    {
-        AllocAndPrintf(response, resp_size, "{'message': 'Unknown method %s'}", method_name);
-        return IOTHUB_CLIENT_OK;
-    }
-    
     int rgb;
     if (!GetNumberFromString(payload, size, &rgb))
     {
@@ -408,8 +489,8 @@ int OnDeviceMethodInvoked(const char* method_name, const unsigned char* payload,
     }
     else
     {
-        FILE *fpConfig;
-        if (NULL == (fpConfig=fopen("AzureMessageReceive","w")))		
+        FILE* fp;
+        if (NULL == (fp = fopen("AzureMessageReceive", "w")))
         {
             printf("Open azure message content file fail.\r\n");
 
@@ -417,31 +498,197 @@ int OnDeviceMethodInvoked(const char* method_name, const unsigned char* payload,
         }
         else
         {
-            fprintf(fpConfig, "\"SetRGBLed\":%d", rgb);
-            fclose(fpConfig);
-            
+            fprintf(fp, "\"SetRGBLed\":%d", rgb);
+            fclose(fp);
+
             AllocAndPrintf(response, resp_size, "{ 'message': 'Accepted, rgb = %d' }", rgb);
         }
+    }
+}
+
+void* FirmwareUpdateThread(void* arg)
+{
+    time_t begin, end, stepBegin, stepEnd;
+    int version = (int)arg;
+
+    // Clear all reportes
+    UpdateReportedProperties("{ 'Method' : { 'UpdateFirmware': null } }");
+
+    time(&begin);
+    UpdateReportedProperties(
+        "{ 'Method' : { 'UpdateFirmware': { 'Duration-s': 0, 'LastUpdate': '%s', 'Status': 'Running' } } }",
+        FormatTime(&begin));
+
+    time(&stepBegin);
+    UpdateReportedProperties(
+        "{ 'Method' : { 'UpdateFirmware': { 'Download' : { 'Duration-s': 0, 'LastUpdate': '%s', 'Status': 'Running' } } } }",
+        FormatTime(&stepBegin));
+
+    ThreadAPI_Sleep(20000);
+
+    time(&stepEnd);
+    if (version <= 0)
+    {
+        UpdateReportedProperties(
+            "{ 'Method' : { 'UpdateFirmware': { 'Download' : { 'Duration-s': %u, 'LastUpdate': '%s', 'Status': 'Failed' } } } }",
+            stepEnd - stepBegin,
+            FormatTime(&stepEnd));
+
+        time(&end);
+        UpdateReportedProperties(
+            "{ 'Method' : { 'UpdateFirmware': { 'Duration-s': %u, 'LastUpdate': '%s', 'Status': 'Failed' } } }",
+            end - begin,
+            FormatTime(&end));
+
+        return NULL;
+    }
+    else
+    {
+        UpdateReportedProperties(
+            "{ 'Method' : { 'UpdateFirmware': { 'Download' : { 'Duration-s': %u, 'LastUpdate': '%s', 'Status': 'Complete' } } } }",
+            stepEnd - stepBegin,
+            FormatTime(&stepEnd));
+    }
+
+    time(&stepBegin);
+    UpdateReportedProperties(
+        "{ 'Method' : { 'UpdateFirmware': { 'Applied' : { 'Duration-s': 0, 'LastUpdate': '%s', 'Status': 'Running' } } } }",
+        FormatTime(&stepBegin));
+
+    ThreadAPI_Sleep(20000);
+
+    time(&stepEnd);
+    UpdateReportedProperties(
+        "{ 'Method' : { 'UpdateFirmware': { 'Applied' : { 'Duration-s': %u, 'LastUpdate': '%s', 'Status': 'Complete' } } } }",
+        stepEnd - stepBegin,
+        FormatTime(&stepEnd));
+
+    time(&stepBegin);
+    UpdateReportedProperties(
+        "{ 'Method' : { 'UpdateFirmware': { 'Reboot' : { 'Duration-s': 0, 'LastUpdate': '%s', 'Status': 'Running' } } } }",
+        FormatTime(&stepBegin));
+
+    ThreadAPI_Sleep(20000);
+
+    time(&stepEnd);
+    UpdateReportedProperties(
+        "{ 'Method' : { 'UpdateFirmware': { 'Reboot' : { 'Duration-s': %u, 'LastUpdate': '%s', 'Status': 'Complete' } } } }",
+        stepEnd - stepBegin,
+        FormatTime(&stepEnd));
+
+    time(&end);
+    UpdateReportedProperties(
+        "{ 'Method' : { 'UpdateFirmware': { 'Duration-s': %u, 'LastUpdate': '%s', 'Status': 'Complete' } } }",
+        end - begin,
+        FormatTime(&end));
+
+    sprintf(g_firmwareVersion, "%d.%d", version / 10, version % 10);
+    if (strcmp(g_firmwareVersion, "2.0") >= 0)
+    {
+        g_telemetryInterval = 5;
+    }
+
+    WriteConfig();
+
+    UpdateReportedProperties(
+        "{ 'System': { 'FirmwareVersion': '%s' }, 'Device': { 'StartupTime': '%s' }, 'Config': { 'TelemetryInterval': %u } }",
+        g_firmwareVersion,
+        FormatTime(&end),
+        g_telemetryInterval);
+
+    return NULL;
+}
+
+void OnMethodFirmwareUpdate(const unsigned char* payload, size_t size, unsigned char** response, size_t* resp_size)
+{
+    const unsigned char* key = "\"FwPackageUri\":";
+
+    unsigned char* p = strstr(payload, key);
+    if (p == NULL)
+    {
+        AllocAndPrintf(response, resp_size, "{ 'message': 'Invalid payload' }");
+        return;
+    }
+
+    unsigned char* pStart = strchr(p + strlen(key), '\"');
+    if (pStart == NULL)
+    {
+        AllocAndPrintf(response, resp_size, "{ 'message': 'Invalid payload' }");
+        return;
+    }
+
+    unsigned char* pEnd = strchr(pStart + 1, '\"');
+    if (pEnd == NULL)
+    {
+        AllocAndPrintf(response, resp_size, "{ 'message': 'Invalid payload' }");
+        return;
+    }
+
+    unsigned char url[1024];
+    strcpy(url, pStart + 1);
+    url[pEnd - pStart - 1] = 0;
+    printf("Updaing firmware with %s\r\n", url);
+    AllocAndPrintf(response, resp_size, "{ 'message': 'Accepted, url = %s' }", url);
+
+    int version;
+    GetNumberFromString(url, strlen(url), &version);
+    printf("Version = %d\r\n", version);
+
+    pthread_t tid;
+    pthread_create(&tid, NULL, &FirmwareUpdateThread, (void*)version);
+}
+
+
+int OnDeviceMethodInvoked(const char* method_name, const unsigned char* payload, size_t size, unsigned char** response, size_t* resp_size, void* userContextCallback)
+{
+    printf("Method call: name = %s, payload = %.*s\r\n", method_name, size, payload);
+
+    if (strcmp(method_name, "SetRGBLED") == 0)
+    {
+        OnMethodSetRGBLED(payload, size, response, resp_size);
+    }
+    else if (strcmp(method_name, "InitiateFirmwareUpdate") == 0)
+    {
+        OnMethodFirmwareUpdate(payload, size, response, resp_size);
+    }
+    else
+    {
+        AllocAndPrintf(response, resp_size, "{'message': 'Unknown method %s'}", method_name);
     }
 
     return IOTHUB_CLIENT_OK;
 }
+/* Device method handler region end */
 
-void OnDesiredPropertyChanged(DEVICE_TWIN_UPDATE_STATE update_state, const unsigned char* payLoad, size_t size, void* userContextCallback)
+/* Property update handler region */
+void OnDesiredTelemetryIntervalChanged(int telemetryInterval)
 {
-    printf("Property changed: %s", payLoad);
-    
-    unsigned char *p = strstr(payLoad, "\"TelemetryInterval\":");
-    
-    int interval;
-    if (GetNumberFromString(p, size - (p - payLoad), &interval))
+    g_telemetryInterval = telemetryInterval;
+
+    WriteConfig();
+    ReportConfigProperties();
+
+    printf("Telemetry interval set to %u\r\n", g_telemetryInterval);
+}
+
+void OnDesiredPropertyChanged(DEVICE_TWIN_UPDATE_STATE update_state, const unsigned char* payload, size_t size, void* userContextCallback)
+{
+    printf("Property changed: %.*s\r\n", size, payload);
+
+    UpdateReportedProperties(
+        "{ 'Device': { 'LastDesiredPropertyChange': '%.*s' }}",
+        size,
+        payload);
+
+    unsigned char *p = strstr(payload, "\"TelemetryInterval\":");
+
+    int telemetryInterval;
+    if (GetNumberFromString(p, size - (p - payload), &telemetryInterval) && telemetryInterval > 0)
     {
-        telemetryInterval = interval;
-        
-        IOTHUB_CLIENT_HANDLE iotHubClientHandle = (IOTHUB_CLIENT_HANDLE)userContextCallback;
-        ReportConfigProperties(iotHubClientHandle);
+        OnDesiredTelemetryIntervalChanged(telemetryInterval);
     }
 }
+/* Property update handler region end */
 
 void remote_monitoring_run(void)
 {
@@ -449,9 +696,9 @@ void remote_monitoring_run(void)
     char *ptr;
     char i;
 
-    while(1)
+    while (1)
     {
-        if (NULL == (fpConfig=fopen("AzureConnectionString","r")))
+        if (NULL == (fpConfig = fopen("AzureConnectionString", "r")))
         {
             printf("Open azure connection string file fail.\r\n");
         }
@@ -465,11 +712,11 @@ void remote_monitoring_run(void)
             {
                 printf("Load Azure Connection Sting ok.\r\n");
                 fclose(fpConfig);
-                
-                if(getAccountInfo(msgText))
+
+                if (getAccountInfo(msgText))
                 {
                     printf("Azure Client Sting Form is right.\r\n");
-                    break;    
+                    break;
                 }
                 else
                 {
@@ -477,10 +724,10 @@ void remote_monitoring_run(void)
                 }
             }
         }
-        
+
         ThreadAPI_Sleep(1000);
     }
-    
+
     if (platform_init() != 0)
     {
         printf("Failed to initialize the platform.\r\n");
@@ -507,6 +754,8 @@ void remote_monitoring_run(void)
             config.protocol = HTTP_Protocol;
 #endif
             iotHubClientHandle = IoTHubClient_Create(&config);
+            g_iotHubClientHandle = iotHubClientHandle;
+
             if (iotHubClientHandle == NULL)
             {
                 (void)printf("Failed on IoTHubClient_CreateFromConnectionString\r\n");
@@ -534,11 +783,11 @@ void remote_monitoring_run(void)
                     {
                         printf("unable to IoTHubClient_SetMessageCallback\r\n");
                     }
-                    else if (IoTHubClient_SetDeviceMethodCallback(iotHubClientHandle, OnDeviceMethodInvoked, (void*)iotHubClientHandle) != IOTHUB_CLIENT_OK)
+                    else if (IoTHubClient_SetDeviceMethodCallback(iotHubClientHandle, OnDeviceMethodInvoked, NULL) != IOTHUB_CLIENT_OK)
                     {
                         printf("unable to IoTHubClient_SetDeviceMethodCallback\r\n");
                     }
-                    else if (IoTHubClient_SetDeviceTwinCallback(iotHubClientHandle, OnDesiredPropertyChanged, (void*)iotHubClientHandle) != IOTHUB_CLIENT_OK)
+                    else if (IoTHubClient_SetDeviceTwinCallback(iotHubClientHandle, OnDesiredPropertyChanged, NULL) != IOTHUB_CLIENT_OK)
                     {
                         printf("unable to IoTHubClient_SetDeviceTwinCallback\r\n");
                     }
@@ -577,7 +826,7 @@ void remote_monitoring_run(void)
                                 }
                                 else
                                 {
-                                    (void)printf("%s\r\n", buffer);
+                                    (void)printf("%.*s\r\n", bufferSize, buffer);
                                     sendMessage(iotHubClientHandle, buffer, bufferSize);
                                 }
 
@@ -585,10 +834,10 @@ void remote_monitoring_run(void)
 
                             STRING_delete(commandsMetadata);
                         }
-                        
-                        ReportSystemProperties(iotHubClientHandle);
-                        ReportSupportedMethods(iotHubClientHandle);
-                        ReportConfigProperties(iotHubClientHandle);
+
+                        ReportSystemProperties();
+                        ReportSupportedMethods();
+                        ReportConfigProperties();
 
                         thermostat->Temperature = 0;
                         thermostat->Humidity = 0;
@@ -596,47 +845,64 @@ void remote_monitoring_run(void)
                         thermostat->Sound = 0;
                         thermostat->DeviceId = (char*)deviceId;
 
-                        while(1)
+                        while (1)
                         {
-                            ThreadAPI_Sleep(telemetryInterval * 1000);
-                            
-                            memset(msgText, 0, sizeof(msgText));
-                            
-                            if (NULL == (fpConfig=fopen("AzureMessageSend","r")))
+                            printf("Sleep for %u second...\r\n", g_telemetryInterval);
+                            ThreadAPI_Sleep(g_telemetryInterval * 1000);
+
+                            if (strcmp(g_firmwareVersion, "2.0") < 0)
                             {
-                                printf("Open message file fail.\r\n");
+                                int temperature = rand() % 20 + 65;
+                                int humidity = rand() % 40 + 10;
+
+                                snprintf(
+                                    msgBuffer,
+                                    sizeof(msgBuffer),
+                                    "{ \"DeviceId\": \"%s\", \"Temperature\": %d, \"Humidity\": %d, \"Light\": 0, \"Sound\": 0 }",
+                                    deviceId,
+                                    temperature,
+                                    humidity);
+
+                                printf("%s.\r\n", msgBuffer);
+                                sendMessage(iotHubClientHandle, msgBuffer, strlen(msgBuffer));
                             }
                             else
                             {
-                                fgets(msgText, sizeof(msgText), fpConfig);
-                                fclose(fpConfig);
-                            }
+                                memset(msgText, 0, sizeof(msgText));
 
-                            ptr = strstr(msgText, ">CLIENT_SEND");
-                            if (ptr)
-                            {
-                                printf("Get CLIENT SEND: command\r\n");
-
-                                memset(msgBuffer, 0, sizeof(msgBuffer));
-                                
-                                for(i = 0;i < 12;i ++)*(ptr + i) = 0;
-                                
-                                snprintf(msgBuffer, sizeof(msgBuffer), "{\"DeviceId\":\"%s\",%s}", deviceId, msgText);
-                                
-                                printf("%s.\r\n", msgBuffer);
-                                
-                                sendMessage(iotHubClientHandle, msgBuffer, strlen(msgBuffer));
- 
-                                (void)printf("Wait for message send...\r\n");
-                                
-                                if (NULL == (fpConfig=fopen("AzureMessageSend","w")))
+                                if (NULL == (fpConfig = fopen("AzureMessageSend", "r")))
                                 {
                                     printf("Open message file fail.\r\n");
                                 }
                                 else
                                 {
-                                    fwrite("SEND OK!", 1, 8, fpConfig);
+                                    fgets(msgText, sizeof(msgText), fpConfig);
                                     fclose(fpConfig);
+                                }
+
+                                ptr = strstr(msgText, ">CLIENT_SEND");
+                                if (ptr)
+                                {
+                                    printf("Get CLIENT SEND: command\r\n");
+
+                                    memset(msgBuffer, 0, sizeof(msgBuffer));
+
+                                    for (i = 0; i < 12; i++)*(ptr + i) = 0;
+
+                                    snprintf(msgBuffer, sizeof(msgBuffer), "{\"DeviceId\":\"%s\",%s}", deviceId, msgText);
+
+                                    printf("%s.\r\n", msgBuffer);
+                                    sendMessage(iotHubClientHandle, msgBuffer, strlen(msgBuffer));
+
+                                    if (NULL == (fpConfig = fopen("AzureMessageSend", "w")))
+                                    {
+                                        printf("Open message file fail.\r\n");
+                                    }
+                                    else
+                                    {
+                                        fwrite("SEND OK!", 1, 8, fpConfig);
+                                        fclose(fpConfig);
+                                    }
                                 }
                             }
                         }
@@ -654,7 +920,8 @@ void remote_monitoring_run(void)
 
 int main(void)
 {
+    srand(time(NULL));
+    LoadConfig();
     remote_monitoring_run();
     return 0;
 }
-
